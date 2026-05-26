@@ -230,6 +230,61 @@ function createSSELogger() {
 //  HTTP Proxy
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+//  Model Capabilities Cache
+// ═══════════════════════════════════════════════════════════════
+
+const modelCache = new Map();
+
+/** Fetch model capabilities from OpenRouter and return whether it supports
+ *  image input. Results are cached in memory for the proxy lifetime. */
+function modelSupportsImages(modelId) {
+  return new Promise((resolve) => {
+    if (modelCache.has(modelId)) return resolve(modelCache.get(modelId));
+
+    const url = `https://openrouter.ai/api/v1/models/${encodeURIComponent(modelId)}`;
+    https.get(url, { headers: { accept: "application/json" } }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => data += chunk);
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          const modalities = json?.data?.architecture?.input_modalities;
+          const supports = Array.isArray(modalities) && modalities.includes("image");
+          modelCache.set(modelId, supports);
+          resolve(supports);
+        } catch {
+          // If we can't determine, assume it doesn't support images to be safe.
+          modelCache.set(modelId, false);
+          resolve(false);
+        }
+      });
+    }).on("error", () => {
+      // Network error — assume no image support to be safe.
+      modelCache.set(modelId, false);
+      resolve(false);
+    });
+  });
+}
+
+/** Replace tool_result blocks that contain images with an error message
+ *  when the model doesn't support image input. */
+function stripImageToolResults(messages) {
+  let changed = false;
+  for (const msg of messages) {
+    if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block.type !== "tool_result" || !Array.isArray(block.content)) continue;
+      if (block.content.some(c => c.type === "image")) {
+        block.content = "This model cannot decode images.";
+        block.is_error = true;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 /** Split user messages that mix tool_result blocks with text blocks.
  *  When OpenRouter translates these to OpenAI format for providers like
  *  DeepSeek, the tool response must land before the next user message or
@@ -327,19 +382,23 @@ function proxyRequest(clientReq, clientRes) {
     });
   });
 
-  // Buffer the request body so we can split mixed-content user messages
-  // before forwarding (see splitMixedMessages comment above).
+  // Buffer the request body so we can inspect messages and optionally
+  // strip image tool results for models that don't support them.
   const chunks = [];
   clientReq.on("data", (chunk) => chunks.push(chunk));
-  clientReq.on("end", () => {
+  clientReq.on("end", async () => {
     const raw = Buffer.concat(chunks).toString();
     let body = raw;
     try {
       const obj = JSON.parse(raw);
-      // Only split for DeepSeek models (OpenRouter translates to OpenAI
-      // format where tool results must precede the next user message).
-      if (obj.messages && /deepseek/i.test(obj.model)) {
-        splitMixedMessages(obj.messages);
+      if (obj.messages && obj.model) {
+        const supportsImages = await modelSupportsImages(obj.model);
+        if (!supportsImages) {
+          stripImageToolResults(obj.messages);
+        }
+        if (/deepseek/i.test(obj.model)) {
+          splitMixedMessages(obj.messages);
+        }
         body = JSON.stringify(obj);
       }
     } catch { /* pass non-JSON bodies through unmodified */ }
