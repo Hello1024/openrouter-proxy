@@ -254,14 +254,12 @@ function modelSupportsImages(modelId) {
           modelCache.set(modelId, supports);
           resolve(supports);
         } catch {
-          // If we can't determine, assume it doesn't support images to be safe.
-          modelCache.set(modelId, false);
+          // Malformed response — don't cache so we retry next time.
           resolve(false);
         }
       });
     }).on("error", () => {
-      // Network error — assume no image support to be safe.
-      modelCache.set(modelId, false);
+      // Network error — don't cache so we retry next time.
       resolve(false);
     });
   });
@@ -387,24 +385,30 @@ function proxyRequest(clientReq, clientRes) {
   const chunks = [];
   clientReq.on("data", (chunk) => chunks.push(chunk));
   clientReq.on("end", async () => {
-    const raw = Buffer.concat(chunks).toString();
-    let body = raw;
     try {
-      const obj = JSON.parse(raw);
-      if (obj.messages && obj.model) {
-        const supportsImages = await modelSupportsImages(obj.model);
-        if (!supportsImages) {
-          stripImageToolResults(obj.messages);
+      const raw = Buffer.concat(chunks).toString();
+      let body = raw;
+      try {
+        const obj = JSON.parse(raw);
+        if (obj.messages && obj.model) {
+          const supportsImages = await modelSupportsImages(obj.model);
+          if (!supportsImages) {
+            stripImageToolResults(obj.messages);
+          }
+          if (/deepseek/i.test(obj.model)) {
+            splitMixedMessages(obj.messages);
+          }
+          body = JSON.stringify(obj);
         }
-        if (/deepseek/i.test(obj.model)) {
-          splitMixedMessages(obj.messages);
-        }
-        body = JSON.stringify(obj);
-      }
-    } catch { /* pass non-JSON bodies through unmodified */ }
-    proxyReq.setHeader("Content-Length", Buffer.byteLength(body));
-    proxyReq.write(body);
-    proxyReq.end();
+      } catch { /* pass non-JSON bodies through unmodified */ }
+      proxyReq.setHeader("Content-Length", Buffer.byteLength(body));
+      proxyReq.write(body);
+      proxyReq.end();
+    } catch (err) {
+      log("error", `Request processing error: ${err.message}`);
+      if (!clientRes.headersSent) clientRes.writeHead(500, { "Content-Type": "text/plain" });
+      clientRes.end("Internal proxy error");
+    }
   });
 
   clientReq.on("error", (err) => {
