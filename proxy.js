@@ -11,6 +11,7 @@ const http = require("http");
 const https = require("https");
 const { Transform } = require("stream");
 const { URL } = require("url");
+const zlib = require("zlib");
 
 // ═══════════════════════════════════════════════════════════════
 //  Configuration
@@ -67,8 +68,45 @@ function log(level, msg, extra) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Header Helpers
+//  Error Response Logging
 // ═══════════════════════════════════════════════════════════════
+
+/** Passthrough stream that collects the body; logs 4xx responses with
+ *  gzip/deflate/brotli decompression. */
+function createErrorLogStream(statusCode, path, headers) {
+  const chunks = [];
+  const contentEncoding = (headers["content-encoding"] || "").toLowerCase();
+
+  function decode(raw) {
+    if (contentEncoding === "gzip" || contentEncoding === "x-gzip") {
+      try { return zlib.gunzipSync(raw); } catch { /* fall through */ }
+    } else if (contentEncoding === "deflate") {
+      try { return zlib.inflateSync(raw); } catch { /* fall through */ }
+    } else if (contentEncoding === "br") {
+      try { return zlib.brotliDecompressSync(raw); } catch { /* fall through */ }
+    }
+    return raw;
+  }
+
+  function flushBody() {
+    if (chunks.length === 0) return;
+    const raw = decode(Buffer.concat(chunks));
+    let body = raw.toString("utf8");
+    if (body.length > 2000) body = body.slice(0, 2000) + "...[truncated]";
+    if (statusCode >= 400 && statusCode < 500) {
+      log("error", `${statusCode} ${CLR.dim}${path}${CLR.reset}\n${CLR.dim}${body}${CLR.reset}`);
+    }
+  }
+
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      if (statusCode >= 400 && statusCode < 500) chunks.push(chunk);
+      this.push(chunk);
+      cb();
+    },
+    flush(cb) { flushBody(); cb(); },
+  });
+}
 
 function buildProxyHeaders(original) {
   const h = { ...original };
@@ -243,7 +281,7 @@ function splitMixedMessages(messages) {
     const otherBlocks = msg.content.filter(b => b.type !== "tool_result");
     if (toolBlocks.length > 0 && otherBlocks.length > 0) {
       msg.content = toolBlocks;
-      messages.splice(i + 1, 0, { role: "user", content: otherBlocks });
+      messages.splice(i + 1, 0, { ...msg, content: otherBlocks });
     }
   }
 }
@@ -311,7 +349,8 @@ function proxyRequest(clientReq, clientRes) {
     } else if (sse) {
       proxyRes.pipe(createSSELogger()).pipe(clientRes);
     } else {
-      proxyRes.pipe(clientRes);
+      const errLog = createErrorLogStream(proxyRes.statusCode, targetUrl.pathname + targetUrl.search, proxyRes.headers);
+      proxyRes.pipe(errLog).pipe(clientRes);
     }
 
     proxyRes.on("end", () => {
@@ -336,8 +375,17 @@ function proxyRequest(clientReq, clientRes) {
     let body = raw;
     try {
       const obj = JSON.parse(raw);
-      // Only split for DeepSeek models (OpenRouter translates to OpenAI
-      // format where tool results must precede the next user message).
+
+      // Disable DeepSeek thinking mode — it returns reasoning_content that
+      // must be echoed back on subsequent requests, which Claude Code doesn't
+      // do, causing 400 errors.
+      if (obj.model && /deepseek/i.test(obj.model)) {
+        if (!obj.thinking || obj.thinking.type !== "disabled") {
+          obj.thinking = { type: "disabled" };
+          body = JSON.stringify(obj);
+        }
+      }
+
       if (obj.messages && /deepseek/i.test(obj.model)) {
         splitMixedMessages(obj.messages);
         body = JSON.stringify(obj);
