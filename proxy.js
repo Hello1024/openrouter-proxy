@@ -243,7 +243,7 @@ function modelSupportsImages(modelId) {
     if (modelCache.has(modelId)) return resolve(modelCache.get(modelId));
 
     const url = `https://openrouter.ai/api/v1/models/${encodeURIComponent(modelId)}`;
-    https.get(url, { headers: { accept: "application/json" } }, (res) => {
+    const req = https.get(url, { headers: { accept: "application/json" } }, (res) => {
       let data = "";
       res.on("data", (chunk) => data += chunk);
       res.on("end", () => {
@@ -258,8 +258,13 @@ function modelSupportsImages(modelId) {
           resolve(false);
         }
       });
-    }).on("error", () => {
+    });
+    req.on("error", () => {
       // Network error — don't cache so we retry next time.
+      resolve(false);
+    });
+    req.setTimeout(5000, () => {
+      req.destroy();
       resolve(false);
     });
   });
@@ -393,7 +398,8 @@ function proxyRequest(clientReq, clientRes) {
         if (obj.messages && obj.model) {
           const supportsImages = await modelSupportsImages(obj.model);
           if (!supportsImages) {
-            stripImageToolResults(obj.messages);
+            const changed = stripImageToolResults(obj.messages);
+            if (changed && CONFIG.verbose) log("warn", `Stripped image tool results — model=${obj.model} lacks vision support`);
           }
           if (/deepseek/i.test(obj.model)) {
             splitMixedMessages(obj.messages);
