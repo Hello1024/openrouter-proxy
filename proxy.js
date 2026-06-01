@@ -71,7 +71,7 @@ function log(level, msg, extra) {
 //  Error Response Logging
 // ═══════════════════════════════════════════════════════════════
 
-/** Passthrough stream that collects the body; logs 4xx responses with
+/** Passthrough stream that collects the body; logs 4xx/5xx responses with
  *  gzip/deflate/brotli decompression. */
 function createErrorLogStream(statusCode, path, headers) {
   const chunks = [];
@@ -93,14 +93,14 @@ function createErrorLogStream(statusCode, path, headers) {
     const raw = decode(Buffer.concat(chunks));
     let body = raw.toString("utf8");
     if (body.length > 2000) body = body.slice(0, 2000) + "...[truncated]";
-    if (statusCode >= 400 && statusCode < 500) {
+    if (statusCode >= 400) {
       log("error", `${statusCode} ${CLR.dim}${path}${CLR.reset}\n${CLR.dim}${body}${CLR.reset}`);
     }
   }
 
   return new Transform({
     transform(chunk, _enc, cb) {
-      if (statusCode >= 400 && statusCode < 500) chunks.push(chunk);
+      if (statusCode >= 400) chunks.push(chunk);
       this.push(chunk);
       cb();
     },
@@ -268,6 +268,64 @@ function createSSELogger() {
 //  HTTP Proxy
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+//  Model Capabilities Cache
+// ═══════════════════════════════════════════════════════════════
+
+const modelCache = new Map();
+
+/** Fetch model capabilities from OpenRouter and return whether it supports
+ *  image input. Results are cached in memory for the proxy lifetime. */
+function modelSupportsImages(modelId) {
+  return new Promise((resolve) => {
+    if (modelCache.has(modelId)) return resolve(modelCache.get(modelId));
+
+    const url = `https://openrouter.ai/api/v1/models/${encodeURIComponent(modelId)}`;
+    const req = https.get(url, { headers: { accept: "application/json" } }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => data += chunk);
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          const modalities = json?.data?.architecture?.input_modalities;
+          const supports = Array.isArray(modalities) && modalities.includes("image");
+          modelCache.set(modelId, supports);
+          resolve(supports);
+        } catch {
+          // Malformed response — don't cache so we retry next time.
+          resolve(false);
+        }
+      });
+    });
+    req.on("error", () => {
+      // Network error — don't cache so we retry next time.
+      resolve(false);
+    });
+    req.setTimeout(5000, () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+/** Replace tool_result blocks that contain images with an error message
+ *  when the model doesn't support image input. */
+function stripImageToolResults(messages) {
+  let changed = false;
+  for (const msg of messages) {
+    if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block.type !== "tool_result" || !Array.isArray(block.content)) continue;
+      if (block.content.some(c => c.type === "image")) {
+        block.content = "This model cannot decode images.";
+        block.is_error = true;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 /** Split user messages that mix tool_result blocks with text blocks.
  *  When OpenRouter translates these to OpenAI format for providers like
  *  DeepSeek, the tool response must land before the next user message or
@@ -366,34 +424,49 @@ function proxyRequest(clientReq, clientRes) {
     });
   });
 
-  // Buffer the request body so we can split mixed-content user messages
-  // before forwarding (see splitMixedMessages comment above).
+  // Buffer the request body so we can inspect messages and optionally
+  // strip image tool results for models that don't support them.
   const chunks = [];
   clientReq.on("data", (chunk) => chunks.push(chunk));
-  clientReq.on("end", () => {
-    const raw = Buffer.concat(chunks).toString();
-    let body = raw;
+  clientReq.on("end", async () => {
     try {
-      const obj = JSON.parse(raw);
+      const raw = Buffer.concat(chunks).toString();
+      let body = raw;
+      try {
+        const obj = JSON.parse(raw);
+        if (obj.messages && obj.model) {
+          // Disable DeepSeek thinking mode — it returns reasoning_content that
+          // must be echoed back on subsequent requests, which Claude Code doesn't
+          // do, causing 400 errors.
+          if (/deepseek/i.test(obj.model)) {
+            if (!obj.thinking || obj.thinking.type !== "disabled") {
+              obj.thinking = { type: "disabled" };
+              body = JSON.stringify(obj);
+            }
+          }
 
-      // Disable DeepSeek thinking mode — it returns reasoning_content that
-      // must be echoed back on subsequent requests, which Claude Code doesn't
-      // do, causing 400 errors.
-      if (obj.model && /deepseek/i.test(obj.model)) {
-        if (!obj.thinking || obj.thinking.type !== "disabled") {
-          obj.thinking = { type: "disabled" };
+          // Strip image tool results when the model lacks vision support.
+          const supportsImages = await modelSupportsImages(obj.model);
+          if (!supportsImages) {
+            const changed = stripImageToolResults(obj.messages);
+            if (changed && CONFIG.verbose) log("warn", `Stripped image tool results — model=${obj.model} lacks vision support`);
+          }
+
+          if (/deepseek/i.test(obj.model)) {
+            splitMixedMessages(obj.messages);
+          }
           body = JSON.stringify(obj);
         }
-      }
-
-      if (obj.messages && /deepseek/i.test(obj.model)) {
-        splitMixedMessages(obj.messages);
-        body = JSON.stringify(obj);
-      }
-    } catch { /* pass non-JSON bodies through unmodified */ }
-    proxyReq.setHeader("Content-Length", Buffer.byteLength(body));
-    proxyReq.write(body);
-    proxyReq.end();
+      } catch { /* pass non-JSON bodies through unmodified */ }
+      log("info", `${CLR.dim}REQ→ ${targetUrl.pathname}${targetUrl.search} body=${body.slice(0, 5000)}${CLR.reset}`);
+      proxyReq.setHeader("Content-Length", Buffer.byteLength(body));
+      proxyReq.write(body);
+      proxyReq.end();
+    } catch (err) {
+      log("error", `Request processing error: ${err.message}`);
+      if (!clientRes.headersSent) clientRes.writeHead(500, { "Content-Type": "text/plain" });
+      clientRes.end("Internal proxy error");
+    }
   });
 
   clientReq.on("error", (err) => {
