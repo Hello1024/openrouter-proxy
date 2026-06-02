@@ -342,6 +342,18 @@ function proxyRequest(clientReq, clientRes) {
         splitMixedMessages(obj.messages);
         body = JSON.stringify(obj);
       }
+
+      // Work around OpenRouter 500 bug: streaming requests with
+      // tool_choice {"type":"tool","name":"X"} or {"type":"any"}
+      // trigger upstream 500 errors. Rewrite to {"type":"auto"}.
+      if (obj.stream && obj.tool_choice && typeof obj.tool_choice === "object") {
+        const tc = obj.tool_choice.type;
+        if (tc === "tool" || tc === "any") {
+          obj.tool_choice = { type: "auto" };
+          body = JSON.stringify(obj);
+          if (CONFIG.verbose) log("warn", `Rewrote tool_choice "${tc}"→"auto" for streaming (OpenRouter 500 workaround)`);
+        }
+      }
     } catch { /* pass non-JSON bodies through unmodified */ }
     proxyReq.setHeader("Content-Length", Buffer.byteLength(body));
     proxyReq.write(body);
