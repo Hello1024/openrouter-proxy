@@ -445,6 +445,18 @@ function proxyRequest(clientReq, clientRes) {
             }
           }
 
+          // Work around OpenRouter 500 bug: streaming + tool_choice
+          // {"type":"tool","name":"X"} or {"type":"any"} cause 500 errors.
+          // Rewrite to {"type":"auto"} which works fine.
+          if (obj.stream && obj.tool_choice && typeof obj.tool_choice === "object") {
+            const tc = obj.tool_choice.type;
+            if (tc === "tool" || tc === "any") {
+              obj.tool_choice = { type: "auto" };
+              body = JSON.stringify(obj);
+              if (CONFIG.verbose) log("warn", `Rewrote tool_choice from "${tc}" to "auto" — works around OpenRouter streaming 500`);
+            }
+          }
+
           // Strip image tool results when the model lacks vision support.
           const supportsImages = await modelSupportsImages(obj.model);
           if (!supportsImages) {
